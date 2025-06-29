@@ -20,6 +20,22 @@ import scala.collection.mutable.ArrayBuffer
  *
  * In particular, one tricky thing with the PMP is how the PMPADDRx LSB bits are handled in regard of the granularity.
  * Their value change depending the PMPCFGx XD
+ *
+ * Smepmp (Enhanced PMP) Plugin implementation
+ * 
+ * This plugin implements the RISC-V Smepmp extension which enhances the Physical Memory Protection (PMP)
+ * with additional security features including:
+ * - Machine Security Configuration register (mseccfg)
+ * - Rule Locking Bypass (RLB) 
+ * - Machine Mode Whitelist Policy (MMWP)
+ * - Machine Mode Lock Bypass (MML)
+ * 
+ * Key differences from standard PMP:
+ * 1. When MML=1, locked PMP entries can be bypassed by M-mode when RLB=1
+ * 2. When MMWP=1, M-mode follows PMP rules (whitelist policy) instead of bypass
+ * 3. Additional security controls for preventing M-mode from accessing certain regions
+ * 
+ * Reference: RISC-V Smepmp Extension Specification v1.0
  */
 
 
@@ -103,8 +119,8 @@ class PmpPlugin(val p : PmpParam) extends FiberPlugin with PmpService{
 
     if(Riscv.XLEN.get == 64) assert(
       granularity >= 8,
-      """VexiiRiscv RV64 doesn't support granularity smaller than 8 bytes, as durring 8 bytes accesses,
-        | it would need to check that the upper 4 bytes of access are contained in the pmp regions aswell""".stripMargin
+      """VexiiRiscv RV64 doesn't support granularity smaller than 8 bytes, as during 8 bytes accesses,
+        | it would need to check that the upper 4 bytes of access are contained in the pmp regions as well""".stripMargin
     )
 
     case class Cfg() extends Bundle{
@@ -113,9 +129,23 @@ class PmpPlugin(val p : PmpParam) extends FiberPlugin with PmpService{
       val locked = Bool()
     }
 
-    val pRange = Global.PHYSICAL_WIDTH-1 downto granularityWidth
-    // This is a tricky thing, basicaly the granularity doesn't affect TOR and NAPOT csr in the same way.
-    // In particular the granularityWidth-2 bit
+    // Machine Security Configuration register (mseccfg) - Enhanced PMP feature
+    case class MseccfgReg() extends Bundle {
+      val reserved = Bits(29 bits)
+      val mml = Bool()  // Machine Mode Lock Bypass
+      val mmwp = Bool() // Machine Mode Whitelist Policy  
+      val rlb = Bool()  // Rule Locking Bypass
+    }
+
+    val mseccfg = withMseccfg generate Reg(MseccfgReg())
+    if (withMseccfg) {
+      mseccfg.reserved.init(0)
+      mseccfg.mml.init(False)
+      mseccfg.mmwp.init(False)
+      mseccfg.rlb.init(False)
+    }
+
+    val pRange = Global.PHYSICAL_WIDTH - 1 downto granularityWidth
     val extraBit = granularity > 4
 
     // Generate all the PMP entries storage + CSR mapping
@@ -123,8 +153,15 @@ class PmpPlugin(val p : PmpParam) extends FiberPlugin with PmpService{
       val isLocked = Bool()
       val address = Reg(UInt(Global.PHYSICAL_WIDTH.get - granularityWidth + extraBit.toInt bits))
       val cfg = Reg(Cfg())
-      val cfgNext = CombInit(cfg) // This allows to handle WARL (Write Any, Read Legal) on the CSRs
-      when(!cfg.locked) {
+      val cfgNext = CombInit(cfg)
+
+      // Enhanced PMP locking logic with MML and RLB support
+      val effectiveLocked = withMseccfg.mux(
+        cfg.locked && !(mseccfg.mml && mseccfg.rlb),
+        cfg.locked
+      )
+
+      when(!effectiveLocked) {
         cfg := cfgNext
         cfg.write clearWhen (!cfgNext.read)
         if(!p.withTor) when(cfgNext.kind === 1) {cfg.kind := 0}
@@ -135,8 +172,7 @@ class PmpPlugin(val p : PmpParam) extends FiberPlugin with PmpService{
       }
 
       if(i == 0){
-        // Allows software which is unaware of the PMP but uses the supervisor/user modes
-        // to get access to all the memory by default after reset
+        // Allow software unaware of PMP to access all memory by default
         assert(p.withNapot)
         address.init(address.getAllTrue)
         cfg.read init(True)
@@ -169,11 +205,23 @@ class PmpPlugin(val p : PmpParam) extends FiberPlugin with PmpService{
       csr.write(CSR.PMPCFG + cfgId,  0+cfgOffset -> cfgNext.read, 1+cfgOffset -> cfgNext.write, 2+cfgOffset -> cfgNext.execute, 3+cfgOffset -> cfgNext.kind, 7+cfgOffset -> cfgNext.locked)
     }
 
-    for(i <- 0 until pmpSize; self = entries(i)) {
-      self.isLocked := self.cfg.locked || (i+1 != pmpSize).mux(entries(i+1).cfg.locked && entries(i+1).isTor , False)
+    for (i <- 0 until pmpSize; self = entries(i)) {
+      val nextEntryLocked = (i + 1 != pmpSize).mux(entries(i + 1).cfg.locked && entries(i + 1).isTor, False)
+      val effectiveNextLocked = withMseccfg.mux(
+        nextEntryLocked && !(mseccfg.mml && mseccfg.rlb),
+        nextEntryLocked
+      )
+      self.isLocked := self.cfg.locked || effectiveNextLocked
     }
 
-    val allFilter = CsrListFilter((0 to 15).map(_ + CSR.PMPADDR) ++ (0 to 3).filter(i => Riscv.XLEN.get == 32 || (i % 2) == 0).map(_ + CSR.PMPCFG))
+    // Add mseccfg CSR mapping
+    if (withMseccfg) {
+      val MSECCFG = 0x747
+      csr.read(MSECCFG, 0 -> mseccfg.rlb, 1 -> mseccfg.mmwp, 2 -> mseccfg.mml)
+      csr.write(MSECCFG, 0 -> mseccfg.rlb, 1 -> mseccfg.mmwp, 2 -> mseccfg.mml)
+    }
+
+    val allFilter = CsrListFilter((0 to 15).map(_ + CSR.PMPADDR) ++ (0 to 3).filter(i => Riscv.XLEN.get == 32 || (i % 2) == 0).map(_ + CSR.PMPCFG) ++ (if (withMseccfg) Seq(0x747) else Seq.empty))
     if(p.pmpSize > 0) csr.onDecode(allFilter) {
       when(csr.bus.decode.write) {
         csr.bus.decode.doTrap(TrapReason.NEXT)
@@ -186,8 +234,17 @@ class PmpPlugin(val p : PmpParam) extends FiberPlugin with PmpService{
     portsLock.await()
 
     val isMachine = priv.isMachine(0)
-    val instructionShouldHit = !isMachine
-    val dataShouldHit = !isMachine || priv.logic.harts(0).m.status.mprv && priv.logic.harts(0).m.status.mpp =/= 3
+    
+    // Enhanced PMP logic with Smepmp features
+    val instructionShouldHit = withMseccfg.mux(
+      !isMachine || (mseccfg.mmwp && isMachine),
+      !isMachine
+    )
+    
+    val dataShouldHit = withMseccfg.mux(
+      !isMachine || (mseccfg.mmwp && isMachine) || (priv.logic.harts(0).m.status.mprv && priv.logic.harts(0).m.status.mpp =/= 3),
+      !isMachine || priv.logic.harts(0).m.status.mprv && priv.logic.harts(0).m.status.mpp =/= 3
+    )
 
     val ports = for(ps <- portSpecs) yield new Composite(ps.rsp, "logic", false){
       import ps._
@@ -206,10 +263,26 @@ class PmpPlugin(val p : PmpParam) extends FiberPlugin with PmpService{
         }
         val HIT_ANY = { import hitsStage._ ; insert(p.withNapot.mux(e.isNapot && napot.HIT, False) || p.withTor.mux(e.isTor && tor.HIT, False)) }
 
-        val instructionCheck = e.cfg.locked || instructionShouldHit
-        val dataCheck = e.cfg.locked || dataShouldHitPort
+        // Enhanced permission checking with Smepmp features
+        val modeCheck = withMseccfg.mux(
+          // With Smepmp: check if entry is locked or if we should enforce PMP rules
+          e.cfg.locked || instructionShouldHit || dataShouldHitPort,
+          // Without Smepmp: original logic
+          e.cfg.locked || instructionShouldHit
+        )
+
+        val instructionCheck = withMseccfg.mux(
+          e.cfg.locked || instructionShouldHit,
+          e.cfg.locked || instructionShouldHit
+        )
+        
+        val dataCheck = withMseccfg.mux(
+          e.cfg.locked || dataShouldHitPort,
+          e.cfg.locked || dataShouldHitPort
+        )
+
         val normalRwx = (!ps.execute(permStage) || e.cfg.execute || !instructionCheck) &&
-                        (((!ps.write(permStage) || e.cfg.write) && (!ps.read(permStage) || e.cfg.read)) || !dataCheck)
+          (((!ps.write(permStage) || e.cfg.write) && (!ps.read(permStage) || e.cfg.read)) || !dataCheck)
         val PERM_OK = permStage.insert(normalRwx)
       }
       val NEED_HIT = permStage.insert(instructionShouldHit && ps.execute(permStage) || dataShouldHitPort && (ps.read(permStage) || ps.write(permStage)))
@@ -221,7 +294,15 @@ class PmpPlugin(val p : PmpParam) extends FiberPlugin with PmpService{
         val reader = onEntries.reader(oh)
         val entriesReader = entries.reader(oh)
 
-        rsp.ACCESS_FAULT := (NEED_HIT || entriesReader(e => e.isLocked)) && !(reader(e => ps.rspStage(e.PERM_OK)))
+        // Enhanced access fault logic with Smepmp considerations
+        val baseFault = (NEED_HIT || entriesReader(e => e.isLocked)) && !(reader(e => ps.rspStage(e.PERM_OK)))
+        
+        rsp.ACCESS_FAULT := withMseccfg.mux(
+          // With Smepmp: consider MML and MMWP flags
+          baseFault && !(mseccfg.mml && mseccfg.rlb && isMachine && !mseccfg.mmwp),
+          // Without Smepmp: original logic
+          baseFault
+        )
       }
       if(p.pmpSize == 0) ps.rspStage(rsp.ACCESS_FAULT) := False
     }
