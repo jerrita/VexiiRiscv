@@ -100,6 +100,7 @@ class SocConfig(){
     opt[Int]("cpu-count") action { (v, c) => cpuCount = v }
     opt[Int]("l2-bytes") action { (v, c) => l2Bytes = v }
     opt[Int]("l2-ways") action { (v, c) => l2Ways = v }
+    opt[Int]("pmp-size") text("PMP Entries") action { (v, c) => vexiiParam.pmpParam.pmpSize = v }
     opt[Unit]("with-dma") action { (v, c) => withDma = true }
     opt[Unit]("with-cpu-clk") action { (v, c) => withCpuCd = true }
     opt[Unit]("with-axi3") action { (v, c) => withAxi3 = true }

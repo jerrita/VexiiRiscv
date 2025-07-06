@@ -52,7 +52,8 @@ case class PmpParam(
   var pmpSize: Int,
   var granularity: Int,
   var withTor: Boolean = true,
-  var withNapot: Boolean = true
+  var withNapot: Boolean = true,
+  var withMseccfg: Boolean = true
 )
 
 /**
